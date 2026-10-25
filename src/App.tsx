@@ -77,6 +77,8 @@ import { FINANCIAL_TEMPLATE } from './financialTemplate';
 import { SUPPLIER_HALL_RULES, SuppliersAllocationBreakdown } from './suppliersClassifier';
 import TestPlayground from './components/TestPlayground';
 import UserGuideModal from './components/UserGuideModal';
+import YclientsPanel from './components/YclientsPanel';
+import { fetchYclientsFinance, fetchYclientsServices, isoToRu } from './yclientsApi';
 import { downloadDocxReport } from './docxGenerator';
 
 export interface AggregatedArticleConfig {
@@ -1117,6 +1119,85 @@ export default function App() {
     });
   };
 
+  // ---------------------------------------------------------------------------
+  // Интеграция с Yclients (данные приходят с серверного прокси /api/yclients/*)
+  // ---------------------------------------------------------------------------
+
+  // Вкладка 1: финансовые операции
+  const loadFinanceFromYclients = async (startIso: string, endIso: string): Promise<string> => {
+    const { records, diagnostics } = await fetchYclientsFinance(startIso, endIso);
+    if (records.length === 0) {
+      throw new Error('За выбранный период Yclients не вернул финансовых операций.');
+    }
+    const structured: RawRecord[] = records.map((r, idx) => ({
+      ...r,
+      id: `yc_rec_${idx}_${Date.now()}`,
+      date: parseDate(r.dateStr),
+      rawIndex: idx + 1,
+    }));
+    const period = `${isoToRu(startIso)}_-_${isoToRu(endIso)}`;
+    handleDataParsed(structured, `Финансовые_операции_Yclients_(${period}).xlsx`);
+
+    const lines = [
+      `Загружено операций: ${records.length} (доходов: ${diagnostics.incomeCount}, расходов: ${diagnostics.expenseCount}, переводов между кассами: ${diagnostics.transfersSkipped}).`,
+    ];
+    if (diagnostics.incomeCount > 0) {
+      lines.push(`Доходов с расшифровкой по услугам: ${diagnostics.incomeLinkedToRecords}, без услуги: ${diagnostics.incomeWithoutService}.`);
+    }
+    diagnostics.warnings.forEach((w) => lines.push(w));
+    lines.push('Нажмите «Запустить программу», чтобы сформировать отчёты.');
+    return lines.join('\n');
+  };
+
+  // Вкладка 2: отчёт по услугам
+  const loadServicesFromYclients = async (startIso: string, endIso: string): Promise<string> => {
+    const { records, diagnostics } = await fetchYclientsServices(startIso, endIso);
+    if (records.length === 0) {
+      throw new Error(
+        `За выбранный период не найдено оказанных услуг (записей: ${diagnostics.recordsTotal}, пропущено: ${diagnostics.recordsSkipped} — удалённые или клиент не пришёл).`
+      );
+    }
+    const structured: RawServiceRecord[] = records.map((r, idx) => {
+      const rev = r.points + r.subscriptions + r.certificates + r.clientAccounts + r.money;
+      return {
+        ...r,
+        id: `yc_svc_${idx}_${Date.now()}`,
+        rawIndex: idx + 1,
+        revenue: parseFloat(rev.toFixed(2)),
+      };
+    });
+    const period = `${isoToRu(startIso)}_-_${isoToRu(endIso)}`;
+    setServicesRecords(structured);
+    setServicesFileName(`Услуги_салона_Yclients_(${period}).xlsx`);
+    setServicesStats({
+      totalRows: structured.length,
+      validServiceRows: structured.length,
+      cleanedFieldsCount: 0,
+      recognizedColumns: {
+        service: 'Yclients: услуга записи',
+        discount: 'Yclients: скидка',
+        points: 'Yclients: баллы',
+        subscriptions: 'Yclients: абонементы',
+        certificates: 'Yclients: сертификаты',
+        clientAccounts: 'Yclients: счета клиентов',
+        money: 'Yclients: оплачено деньгами'
+      }
+    });
+    setNotification({
+      status: 'success',
+      message: `Данные по услугам загружены из Yclients: ${structured.length} строк из ${diagnostics.recordsUsed} записей.`
+    });
+
+    const lines = [
+      `Загружено строк услуг: ${structured.length} (записей в отчёте: ${diagnostics.recordsUsed} из ${diagnostics.recordsTotal}).`,
+    ];
+    if (diagnostics.paymentBreakdownFromTransactions > 0) {
+      lines.push(`Разбивка способов оплаты взята из финансовых операций по ${diagnostics.paymentBreakdownFromTransactions} записям.`);
+    }
+    diagnostics.warnings.forEach((w) => lines.push(w));
+    return lines.join('\n');
+  };
+
   return (
     <div className="min-h-screen bg-gray-50/70 pb-20 font-sans">
       <input
@@ -1609,6 +1690,14 @@ export default function App() {
                         Выбрать файл на устройстве
                       </button>
                     </div>
+                  </div>
+
+                  <div className="mt-4">
+                    <YclientsPanel
+                      title="Загрузить финансовые операции из Yclients"
+                      description="Операции по кассам и счетам за выбранный период загрузятся напрямую из Yclients, файл выписки не нужен."
+                      onLoad={loadFinanceFromYclients}
+                    />
                   </div>
                 </div>
 
@@ -3302,6 +3391,12 @@ export default function App() {
             </div>
           </div>
         </div>
+
+        <YclientsPanel
+          title="Загрузить отчёт по услугам из Yclients"
+          description="Услуги из записей клиентов за выбранный период (оказанные визиты) загрузятся напрямую из Yclients, файл не нужен."
+          onLoad={loadServicesFromYclients}
+        />
 
         {/* Upload Box or Active File Summary */}
         {servicesRecords.length === 0 ? (
